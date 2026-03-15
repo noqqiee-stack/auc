@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 import logging
+import sys
 from typing import Optional, List
 from datetime import datetime, timezone
 
@@ -11,7 +12,13 @@ import aiohttp
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-SC_TOKEN  = os.getenv("SC_TOKEN", "0dMttjkdBsyVyRSRInJpKYWahGnSxBwgFehkuTCb")
+# --- ИЗМЕНЕНИЕ: Токен теперь получается ТОЛЬКО из переменной окружения ---
+SC_TOKEN = os.getenv("SC_TOKEN")
+if not SC_TOKEN:
+    # Критическая ошибка — приложение не может работать без токена
+    logging.error("SC_TOKEN environment variable is not set. Application will exit.")
+    sys.exit(1)  # Останавливаем запуск приложения
+
 REGION    = os.getenv("REGION", "ru")
 API_BASE  = f"https://eapi.stalcraft.net/{REGION}"
 ITEMS_CACHE = "/tmp/items_cache.json"
@@ -52,14 +59,17 @@ async def load_items():
                                         else item.get("name", iid),
                                 "category": item.get("category", "misc"),
                             }
+                    log.info(f"Items: {len(ITEMS_DB)} загружено с сервера")
+                else:
+                    log.error(f"Failed to load items, status: {resp.status}")
         except Exception as e:
-            log.error(f"Items error: {e}")
+            log.error(f"Items loading error: {e}")
     if ITEMS_DB:
         try:
             with open(ITEMS_CACHE, "w", encoding="utf-8") as f:
                 json.dump(ITEMS_DB, f, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Could not write cache: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -131,13 +141,15 @@ async def api_lots(
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         all_lots = []
         for resp, iid in zip(responses, ids[:40]):
-            if isinstance(resp, Exception): continue
+            if isinstance(resp, Exception):
+                log.warning(f"Failed to fetch lots for {iid}: {resp}")
+                continue
             try:
                 data = await resp.json()
                 for lot in data.get("lots", []):
                     all_lots.append(enrich_lot(lot, iid))
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Error parsing lots for {iid}: {e}")
     filtered = []
     for lot in all_lots:
         if rar_vals is not None and lot["_quality"] not in rar_vals: continue
@@ -213,7 +225,9 @@ async def api_profitable(q: str = "", category: str = "", rarity: str = "", thre
         responses = await asyncio.gather(*tasks, return_exceptions=True)
     by_item: dict = {}
     for resp, iid in zip(responses, ids):
-        if isinstance(resp, Exception): continue
+        if isinstance(resp, Exception):
+            log.warning(f"Failed to fetch profitable lots for {iid}: {resp}")
+            continue
         try:
             data = await resp.json()
             lots = []
@@ -222,8 +236,8 @@ async def api_profitable(q: str = "", category: str = "", rarity: str = "", thre
                 if rar_vals and lot["_quality"] not in rar_vals: continue
                 lots.append(lot)
             if lots: by_item[iid] = lots
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Error parsing profitable lots for {iid}: {e}")
     profitable = []
     total_checked = 0
     for iid, lots in by_item.items():
