@@ -36,10 +36,11 @@ QUALITY_KEYS = {
 }
 RANK_KEYS = {
     "core.rank.picklock": 0,
-    "core.rank.stalker":  1,
-    "core.rank.veteran":  2,
-    "core.rank.master":   3,
-    "core.rank.legend":   4,
+    "core.rank.novice":   1,
+    "core.rank.stalker":  2,
+    "core.rank.veteran":  3,
+    "core.rank.master":   4,
+    "core.rank.legend":   5,
 }
 
 # Numeric quality from API lots → display info
@@ -56,24 +57,32 @@ ART_QUALITY_NAMES = {
 # обычный - белый; необычный - зелёный; особый - синий;
 # исключительный - красный; легендарный - жёлтый.
 ART_QUALITY_COLORS = {
-    0: "#ffffff",  # обычный
-    1: "#4ade80",  # необычный (зелёный)
-    2: "#60a5fa",  # особый (синий)
-    3: "#f97474",  # редкий → красный
-    4: "#f97474",  # исключительный → красный
-    5: "#fbbf24",  # легендарный → жёлтый
+    0: "#ffffff",  # обычный — белый
+    1: "#4ade80",  # необычный — зелёный
+    2: "#60a5fa",  # особый — синий
+    3: "#f472b6",  # редкий — розовый
+    4: "#f97474",  # исключительный — красный
+    5: "#fbbf24",  # легендарный — жёлтый
 }
 
 # Цвета рангов остальных предметов:
-# белый - отмычка; новичек - зелёный; сталкер - синий;
-# ветеран - розовый; мастер - красный; легенда - жёлтый.
-RANK_NAMES  = {0: "Отмычка", 1: "Сталкер", 2: "Ветеран", 3: "Мастер", 4: "Легенда"}
+# белый - отмычка; зелёный - новичек; синий - сталкер;
+# розовый - ветеран; красный - мастер; жёлтый - легенда.
+RANK_NAMES  = {
+    0: "Отмычка",
+    1: "Новичок",
+    2: "Сталкер",
+    3: "Ветеран",
+    4: "Мастер",
+    5: "Легенда",
+}
 RANK_COLORS = {
     0: "#ffffff",  # Отмычка — белый
-    1: "#4ade80",  # низкий ранг — зелёный
+    1: "#4ade80",  # Новичок — зелёный
     2: "#60a5fa",  # Сталкер — синий
-    3: "#f472b6",  # Ветеран/Мастер — розовый / красный
-    4: "#fbbf24",  # Легенда — жёлтый
+    3: "#f472b6",  # Ветеран — розовый
+    4: "#f97474",  # Мастер — красный
+    5: "#fbbf24",  # Легенда — жёлтый
 }
 
 # Для фильтрации по редкости артефактов (только артефакты)
@@ -299,12 +308,14 @@ def enrich(lot: dict, iid: str) -> dict:
     # Color and name based on category
     art = is_artefact(info.get("category",""))
     if art:
+        # Для артефактов цвет / редкость берём из качества лота
         lot["_color_hex"] = ART_QUALITY_COLORS.get(quality, "#9ca3af")
         lot["_rarity_name"] = ART_QUALITY_NAMES.get(quality, "—")
     else:
-        # For non-artifacts, quality maps to rank
-        lot["_color_hex"] = RANK_COLORS.get(quality, "#9ca3af")
-        lot["_rarity_name"] = RANK_NAMES.get(quality, "—")
+        # Для остальных предметов цвет зависит от ранга предмета из БД EXBO
+        rank_idx = info.get("rank_idx", -1)
+        lot["_color_hex"] = RANK_COLORS.get(rank_idx, "#9ca3af")
+        lot["_rarity_name"] = RANK_NAMES.get(rank_idx, "—") if rank_idx >= 0 else "—"
     amt = lot.get("amount",1) or 1
     price = lot.get("buyoutPrice") or lot.get("startPrice") or 0
     lot["_perUnit"] = price // amt if amt > 1 and price else None
@@ -365,9 +376,15 @@ async def lots(
     q:str="", category:str="", rarity:str="",
     enhancement:str="", qty_from:Optional[int]=None, qty_to:Optional[int]=None,
     sort:str="price", asc:bool=True, page:int=0, per_page:int=10,
+    item_id: str = "",
 ):
     await load_items()
-    ids = search_ids(q, category)
+
+    # Если передан конкретный item_id — работаем только с ним
+    if item_id:
+        ids = [item_id] if item_id in ITEMS_DB else []
+    else:
+        ids = search_ids(q, category)
     if not ids:
         return {"lots": [], "total": 0, "page": page, "pages": 0}
     unloaded = [i for i in ids[:40] if not ITEMS_DB.get(i, {}).get("_loaded")]
