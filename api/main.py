@@ -89,6 +89,11 @@ async def startup():
     await load_items()
 
 # ── Helpers ──────────────────────────────────────────────────────
+async def ensure_items():
+    """Загружает предметы если база пустая."""
+    if not ITEMS_DB:
+        await load_items()
+
 def search_ids(query: str = "", category: str = "") -> List[str]:
     q = query.lower().strip()
     result = []
@@ -131,6 +136,9 @@ def enrich_lot(lot: dict, item_id: str) -> dict:
 # ── Routes ───────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
+    await ensure_items()
+    if not _access_token:
+        await get_access_token()
     return {"status": "ok", "items": len(ITEMS_DB), "token": bool(_access_token)}
 
 @app.get("/api/items/search")
@@ -146,6 +154,8 @@ async def api_lots(
     sort: str = "price", asc: bool = True,
     page: int = 0, per_page: int = 10,
 ):
+    await ensure_items()
+    if not _access_token: await get_access_token()
     ids = search_ids(q, category)
     if not ids:
         return {"lots": [], "total": 0, "page": page, "pages": 0}
