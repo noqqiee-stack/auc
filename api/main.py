@@ -244,7 +244,8 @@ def _match_left_to_right(ql: str, name: str, iid: str) -> bool:
         return True
 
     base = (name or iid).lower()
-    words = [w for w in re.split(r"[\s\-\_]+", base) if w]
+    # делим по любым не-буквенно-цифровым символам (включая кавычки, длинные тире и т.п.)
+    words = [w for w in re.split(r"[^\w]+", base, flags=re.UNICODE) if w]
 
     # Пытаемся сопоставить последовательность токенов с последовательностью слов
     for start in range(0, max(0, len(words) - len(tokens) + 1)):
@@ -344,14 +345,16 @@ async def items_search(q: str="", category: str="", limit: int=40):
     for iid in ids[:limit]:
         if iid not in ITEMS_DB: continue
         d = ITEMS_DB[iid]
-        # Determine color for display
+        # Для списка поиска:
+        #  - артефакты не имеют "базовой" редкости — показываем только категорию;
+        #  - остальные предметы используют ранг из БД EXBO.
         art = is_artefact(d.get("category",""))
         qi  = d.get("quality_idx", -1)
         ri  = d.get("rank_idx", -1)
-        if art and qi >= 0:
-            color_hex  = ART_QUALITY_COLORS.get(qi, "#9ca3af")
-            rarity_name = ART_QUALITY_NAMES.get(qi, "")
-        elif not art and ri >= 0:
+        if art:
+            color_hex = "#9ca3af"
+            rarity_name = ""
+        elif ri >= 0:
             color_hex  = RANK_COLORS.get(ri, "#9ca3af")
             rarity_name = RANK_NAMES.get(ri, "")
         else:
@@ -391,7 +394,9 @@ async def lots(
     if unloaded:
         await batch_load(unloaded)
 
-    # Фильтрация по редкости применяется только к артефактам.
+    # Фильтрация по редкости / рангу:
+    #  - для артефактов — по качеству лота;
+    #  - для остальных предметов — по рангу предмета из БД EXBO.
     rar_vals = ART_RARITY_MAP.get(rarity) if rarity else None
 
     async with aiohttp.ClientSession(headers=sc_hdrs()) as s:
@@ -409,10 +414,17 @@ async def lots(
 
     filtered = []
     for lot in all_lots:
-        # Если запрошена редкость, применяем фильтр только к артефактам.
-        if rar_vals is not None and is_artefact(lot.get("_category", "")):
-            if lot["_quality"] not in rar_vals:
-                continue
+        if rar_vals is not None:
+            if is_artefact(lot.get("_category", "")):
+                # артефакты — по качеству лота
+                if lot["_quality"] not in rar_vals:
+                    continue
+            else:
+                # остальные предметы — по рангу предмета
+                info = ITEMS_DB.get(lot.get("_id",""), {})
+                ri = info.get("rank_idx", -1)
+                if ri not in rar_vals:
+                    continue
         if enhancement and lot["_enh"] != int(enhancement): continue
         amt = lot.get("amount",1)
         if qty_from is not None and amt < qty_from: continue
