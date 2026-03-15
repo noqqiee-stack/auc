@@ -11,56 +11,80 @@ import aiohttp
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-SC_TOKEN  = os.getenv("SC_TOKEN", "0dMttjkdBsyVyRSRInJpKYWahGnSxBwgFehkuTCb")
-REGION    = os.getenv("REGION", "ru")
-API_BASE  = f"https://eapi.stalcraft.net/{REGION}"
-ITEMS_CACHE = "/tmp/items_cache.json"
+CLIENT_ID     = os.getenv("CLIENT_ID", "1434")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "0dMttjkdBsyVyRSRInJpKYWahGnSxBwgFehkuTCb")
+REGION        = os.getenv("REGION", "ru")
+API_BASE      = f"https://eapi.stalcraft.net/{REGION}"
+
+# Заголовки авторизации — Client-Id + Client-Secret напрямую
+SC_HEADERS = {
+    "Client-Id":     CLIENT_ID,
+    "Client-Secret": CLIENT_SECRET,
+}
+
+# База предметов с GitHub EXBO
+ITEMS_URL = "https://raw.githubusercontent.com/EXBO-Studio/stalcraft-database/main/ru/items.json"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="STALCRAFT Auction API", version="2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="STALCRAFT Auction API", version="3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ITEMS_DB: dict = {}
-CLIENT_ID = os.getenv("CLIENT_ID", "1434")
-SC_HEADERS = {"Client-Id": CLIENT_ID, "Client-Secret": SC_TOKEN}
 
 RARITY_MAP = {
-    "white": [0], "green": [1], "blue": [2],
-    "red": [3, 4], "yellow": [5],
+    "white":  [0],
+    "green":  [1],
+    "blue":   [2],
+    "red":    [3, 4],
+    "yellow": [5],
 }
 
 async def load_items():
     global ITEMS_DB
-    if os.path.exists(ITEMS_CACHE):
-        with open(ITEMS_CACHE, "r", encoding="utf-8") as f:
-            ITEMS_DB = json.load(f)
-        log.info(f"Items: {len(ITEMS_DB)} из кэша")
-        return
-    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
-        try:
-            async with session.get(f"{API_BASE}/items", params={"limit": 9999}) as resp:
+    log.info("Загружаю базу предметов с GitHub EXBO...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ITEMS_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    raw = data.get("items", data) if isinstance(data, dict) else data
-                    for item in raw:
-                        iid = item.get("id", "")
-                        if iid:
+                    data = await resp.json(content_type=None)
+                    # Формат EXBO: список объектов с id и name
+                    if isinstance(data, list):
+                        for item in data:
+                            iid = item.get("id", "")
+                            if not iid:
+                                continue
+                            name_obj = item.get("name", {})
+                            if isinstance(name_obj, dict):
+                                name = name_obj.get("ru", name_obj.get("en", iid))
+                            else:
+                                name = str(name_obj) if name_obj else iid
                             ITEMS_DB[iid] = {
-                                "name": item.get("name", {}).get("ru", iid)
-                                        if isinstance(item.get("name"), dict)
-                                        else item.get("name", iid),
+                                "name":     name,
                                 "category": item.get("category", "misc"),
                             }
-        except Exception as e:
-            log.error(f"Items error: {e}")
-    if ITEMS_DB:
-        try:
-            with open(ITEMS_CACHE, "w", encoding="utf-8") as f:
-                json.dump(ITEMS_DB, f, ensure_ascii=False)
-        except Exception:
-            pass
+                    elif isinstance(data, dict):
+                        for iid, item in data.items():
+                            name_obj = item.get("name", {})
+                            if isinstance(name_obj, dict):
+                                name = name_obj.get("ru", name_obj.get("en", iid))
+                            else:
+                                name = str(name_obj) if name_obj else iid
+                            ITEMS_DB[iid] = {
+                                "name":     name,
+                                "category": item.get("category", "misc"),
+                            }
+                    log.info(f"Загружено {len(ITEMS_DB)} предметов")
+                else:
+                    log.error(f"GitHub EXBO вернул {resp.status}")
+    except Exception as e:
+        log.error(f"Ошибка загрузки предметов: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -81,9 +105,9 @@ def search_ids(query: str = "", category: str = "") -> List[str]:
 
 def fmt_time_left(end_str: str) -> str:
     try:
-        end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        end   = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
         delta = end - datetime.now(timezone.utc)
-        s = int(delta.total_seconds())
+        s     = int(delta.total_seconds())
         if s <= 0: return "Истёк"
         d, r = divmod(s, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
         if d: return f"{d}д {h}ч"
@@ -93,16 +117,16 @@ def fmt_time_left(end_str: str) -> str:
         return "—"
 
 def enrich_lot(lot: dict, item_id: str) -> dict:
-    lot["_id"] = item_id
-    lot["_name"] = ITEMS_DB.get(item_id, {}).get("name", item_id)
+    lot["_id"]       = item_id
+    lot["_name"]     = ITEMS_DB.get(item_id, {}).get("name", item_id)
     lot["_category"] = ITEMS_DB.get(item_id, {}).get("category", "misc")
     lot["_timeLeft"] = fmt_time_left(lot.get("endTime", ""))
-    add = lot.get("additional", {})
-    lot["_quality"] = add.get("quality", 0)
-    lot["_enh"] = add.get("potentialLevel", 0)
-    amt = lot.get("amount", 1) or 1
-    price = lot.get("buyoutPrice") or lot.get("startPrice") or 0
-    lot["_perUnit"] = price // amt if amt > 1 and price else None
+    add              = lot.get("additional", {})
+    lot["_quality"]  = add.get("quality", 0)
+    lot["_enh"]      = add.get("potentialLevel", 0)
+    amt              = lot.get("amount", 1) or 1
+    price            = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+    lot["_perUnit"]  = price // amt if amt > 1 and price else None
     return lot
 
 @app.get("/api/health")
@@ -125,10 +149,14 @@ async def api_lots(
     ids = search_ids(q, category)
     if not ids:
         return {"lots": [], "total": 0, "page": page, "pages": 0}
+
     rar_vals = RARITY_MAP.get(rarity) if rarity else None
+
     async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
-        tasks = [session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200})
-                 for iid in ids[:40]]
+        tasks = [
+            session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200})
+            for iid in ids[:40]
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         all_lots = []
         for resp, iid in zip(responses, ids[:40]):
@@ -139,6 +167,7 @@ async def api_lots(
                     all_lots.append(enrich_lot(lot, iid))
             except Exception:
                 pass
+
     filtered = []
     for lot in all_lots:
         if rar_vals is not None and lot["_quality"] not in rar_vals: continue
@@ -150,13 +179,15 @@ async def api_lots(
             s = (lot.get("sellerName") or lot.get("seller") or "").lower()
             if seller.lower() not in s: continue
         filtered.append(lot)
+
     def _key(l):
         if sort == "per_unit":
             amt = l.get("amount", 1) or 1
             return (l.get("buyoutPrice") or l.get("startPrice") or 0) / amt
         if sort == "price": return l.get("buyoutPrice") or l.get("startPrice") or 0
-        if sort == "bid": return l.get("startPrice", 0)
+        if sort == "bid":   return l.get("startPrice", 0)
         return l.get("endTime", "")
+
     filtered.sort(key=_key, reverse=not asc)
     total = len(filtered)
     pages = max(1, -(-total // per_page))
@@ -178,19 +209,21 @@ async def api_history(item_id: str, limit: int = 50):
             raise
         except Exception as e:
             raise HTTPException(500, str(e))
+
     prices = [r.get("price", r.get("buyoutPrice", 0)) for r in records
               if r.get("price") or r.get("buyoutPrice")]
     stats = {}
     if prices:
         stats = {
-            "min": min(prices), "max": max(prices),
-            "avg": int(sum(prices)/len(prices)),
+            "min":    min(prices),
+            "max":    max(prices),
+            "avg":    int(sum(prices)/len(prices)),
             "median": int(statistics.median(prices)),
-            "stdev": int(statistics.stdev(prices)) if len(prices) > 2 else 0,
+            "stdev":  int(statistics.stdev(prices)) if len(prices) > 2 else 0,
         }
     chart_data = []
     for r in records:
-        p = r.get("price", r.get("buyoutPrice", 0))
+        p  = r.get("price", r.get("buyoutPrice", 0))
         ts = r.get("time", r.get("soldAt", ""))
         if p and ts:
             try:
@@ -199,19 +232,24 @@ async def api_history(item_id: str, limit: int = 50):
             except Exception:
                 pass
     chart_data.sort(key=lambda x: x["ts"])
-    return {"item_id": item_id, "item_name": ITEMS_DB.get(item_id, {}).get("name", item_id),
-            "records": chart_data, "stats": stats}
+    return {
+        "item_id":   item_id,
+        "item_name": ITEMS_DB.get(item_id, {}).get("name", item_id),
+        "records":   chart_data,
+        "stats":     stats,
+    }
 
 @app.get("/api/profitable")
 async def api_profitable(q: str = "", category: str = "", rarity: str = "", threshold: float = 0.80):
-    ids = search_ids(q, category)[:30]
+    ids      = search_ids(q, category)[:30]
     rar_vals = RARITY_MAP.get(rarity) if rarity else None
     if not ids:
         return {"lots": [], "stats": {"checked": 0, "found": 0}}
+
     async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
-        tasks = [session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200})
-                 for iid in ids]
+        tasks     = [session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200}) for iid in ids]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
+
     by_item: dict = {}
     for resp, iid in zip(responses, ids):
         if isinstance(resp, Exception): continue
@@ -225,43 +263,45 @@ async def api_profitable(q: str = "", category: str = "", rarity: str = "", thre
             if lots: by_item[iid] = lots
         except Exception:
             pass
-    profitable = []
+
+    profitable    = []
     total_checked = 0
     for iid, lots in by_item.items():
         total_checked += len(lots)
         if len(lots) < 2: continue
         prices = [l.get("buyoutPrice") or l.get("startPrice") or 0 for l in lots]
-        nz = [p for p in prices if p > 0]
+        nz     = [p for p in prices if p > 0]
         if len(nz) >= 2:
             med = statistics.median(nz)
             for lot in lots:
                 p = lot.get("buyoutPrice") or lot.get("startPrice") or 0
                 if 0 < p <= med * threshold:
                     disc = round((1 - p/med)*100, 1)
-                    lot["_discount"] = disc
-                    lot["_avg_price"] = int(med)
+                    lot["_discount"]     = disc
+                    lot["_avg_price"]    = int(med)
                     lot["_profit_label"] = f"-{disc}% от рынка"
                     profitable.append(lot)
         stacks = [l for l in lots if (l.get("amount") or 1) > 1]
         if stacks:
-            pu = [( l.get("buyoutPrice") or l.get("startPrice") or 0) / (l.get("amount",1) or 1)
+            pu = [(l.get("buyoutPrice") or l.get("startPrice") or 0) / (l.get("amount",1) or 1)
                   for l in stacks if (l.get("buyoutPrice") or l.get("startPrice") or 0) > 0]
             if len(pu) >= 2:
                 med_pu = statistics.median(pu)
                 for lot in stacks:
                     if "_discount" in lot: continue
                     amt = lot.get("amount",1) or 1
-                    p = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+                    p   = lot.get("buyoutPrice") or lot.get("startPrice") or 0
                     if p > 0 and p/amt <= med_pu * threshold:
                         disc = round((1 - p/amt/med_pu)*100, 1)
-                        lot["_discount"] = disc
-                        lot["_avg_price"] = int(med_pu * amt)
+                        lot["_discount"]     = disc
+                        lot["_avg_price"]    = int(med_pu * amt)
                         lot["_profit_label"] = f"-{disc}% за шт."
                         profitable.append(lot)
+
     seen = set(); unique = []
     for l in profitable:
         k = (l.get("_id"), l.get("startTime",""), l.get("startPrice",0))
         if k not in seen: seen.add(k); unique.append(l)
     unique.sort(key=lambda l: l.get("_discount",0), reverse=True)
     return {"lots": unique[:50], "stats": {"checked": total_checked, "found": len(unique)}}
-
+    
