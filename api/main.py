@@ -87,6 +87,18 @@ ART_RARITY_MAP = {
     "yellow": [5],
 }
 
+# Значения качества в процентах, которые возвращает аукцион для артефактов
+# (см. официальные описания: Ordinary/Unordinary/...):
+# 100, 115, 130, 145, 160, 175 → индексы 0..5
+QUALITY_PCT_TO_IDX = {
+    100: 0,  # ordinary  (обычный)
+    115: 1,  # unordinary (необычный)
+    130: 2,  # special   (особый)
+    145: 3,  # rare      (редкий)
+    160: 4,  # exclusive (исключительный)
+    175: 5,  # legendary (легендарный)
+}
+
 # ── Category → main category mapping ─────────────────────────
 def main_cat(cat_path: str) -> str:
     return cat_path.split("/")[0] if "/" in cat_path else cat_path
@@ -295,7 +307,13 @@ def enrich(lot: dict, iid: str) -> dict:
     lot["_icon"]     = info.get("icon_path","")
     lot["_timeLeft"] = fmt_time(lot.get("endTime",""))
     add = lot.get("additional",{})
-    quality = add.get("quality", 0)
+    raw_quality = add.get("quality", 0)
+    # Для артефактов аукцион часто отдаёт качество в процентах (100,115,...,175),
+    # поэтому сначала пробуем привести процент к индексу 0..5.
+    if isinstance(raw_quality, (int, float)) and raw_quality > 10:
+        quality = QUALITY_PCT_TO_IDX.get(int(raw_quality), 0)
+    else:
+        quality = int(raw_quality or 0)
     lot["_quality"]  = quality
     lot["_enh"]      = add.get("potentialLevel",0)
     lot["_studied"]  = add.get("isResearched", add.get("researched", None))
