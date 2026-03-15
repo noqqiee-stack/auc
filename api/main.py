@@ -15,97 +15,158 @@ CLIENT_ID     = os.getenv("CLIENT_ID", "1434")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "0dMttjkdBsyVyRSRInJpKYWahGnSxBwgFehkuTCb")
 REGION        = os.getenv("REGION", "ru")
 API_BASE      = f"https://eapi.stalcraft.net/{REGION}"
-TOKEN_URL     = "https://exbo.net/oauth/token"
-ITEMS_URL     = "https://raw.githubusercontent.com/EXBO-Studio/stalcraft-database/main/ru/items.json"
+
+# Client-Id + Client-Secret напрямую в заголовках (App Token)
+SC_HEADERS = {
+    "Client-Id":     CLIENT_ID,
+    "Client-Secret": CLIENT_SECRET,
+}
+
+# GitHub Tree API — отдаёт ВСЕ файлы репо одним запросом
+GITHUB_TREE_URL = (
+    "https://api.github.com/repos/EXBO-Studio/stalcraft-database"
+    "/git/trees/main?recursive=1"
+)
+GITHUB_RAW = "https://raw.githubusercontent.com/EXBO-Studio/stalcraft-database/main"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="STALCRAFT Auction API", version="4.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="STALCRAFT Auction API", version="5.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ITEMS_DB: dict = {}
-_access_token: str = ""
 
 RARITY_MAP = {
     "white": [0], "green": [1], "blue": [2],
     "red": [3, 4], "yellow": [5],
 }
 
-# ── Получаем App Access Token ────────────────────────────────────
-async def get_access_token() -> str:
-    global _access_token
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            TOKEN_URL,
-            data={
-                "grant_type":    "client_credentials",
-                "client_id":     CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "scope":         "",
-            },
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                _access_token = data.get("access_token", "")
-                log.info(f"Access token получен: {_access_token[:30]}...")
-                return _access_token
-            else:
-                text = await resp.text()
-                log.error(f"Ошибка получения токена: {resp.status} {text}")
-                return ""
+CATEGORY_MAP = {
+    "weapon":     "weapon",
+    "armor":      "armor",
+    "attachment": "attachment",
+    "container":  "container",
+    "device":     "device",
+    "misc":       "misc",
+    "artefact":   "artifact",
+    "artifact":   "artifact",
+}
 
-def sc_headers() -> dict:
-    return {"Authorization": f"Bearer {_access_token}"}
-
-# ── База предметов с GitHub EXBO ─────────────────────────────────
 async def load_items():
+    """Загружает список предметов через GitHub Tree API."""
     global ITEMS_DB
-    log.info("Загружаю предметы с GitHub EXBO...")
+    if ITEMS_DB:
+        return
+
+    log.info("Загружаю дерево файлов с GitHub...")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(ITEMS_URL, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    items = data if isinstance(data, list) else list(data.values())
-                    for item in items:
-                        iid = item.get("id", "")
-                        if not iid:
-                            continue
-                        name_obj = item.get("name", {})
-                        name = name_obj.get("ru", name_obj.get("en", iid)) \
-                               if isinstance(name_obj, dict) else str(name_obj or iid)
-                        ITEMS_DB[iid] = {
-                            "name":     name,
-                            "category": item.get("category", "misc"),
-                        }
-                    log.info(f"Загружено {len(ITEMS_DB)} предметов")
+            async with session.get(
+                GITHUB_TREE_URL,
+                headers={"Accept": "application/vnd.github+json"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    log.error(f"GitHub Tree API: {resp.status}")
+                    return
+                data = await resp.json()
+
+        tree = data.get("tree", [])
+        # Ищем файлы вида: ru/items/{category}/{subcat?}/{id}.json
+        items_found = 0
+        for node in tree:
+            path = node.get("path", "")
+            if not path.startswith("ru/items/"):
+                continue
+            if not path.endswith(".json"):
+                continue
+
+            parts = path.split("/")
+            # parts: ["ru", "items", "weapon", "pistol", "0n9q.json"] или
+            #        ["ru", "items", "artefact", "0n9q.json"]
+            if len(parts) < 4:
+                continue
+
+            item_id = parts[-1].replace(".json", "")
+            category_raw = parts[2]  # weapon / armor / artefact / misc ...
+            category = CATEGORY_MAP.get(category_raw, category_raw)
+
+            # Имя будем подгружать по требованию, пока храним id + category
+            ITEMS_DB[item_id] = {
+                "name":     item_id,  # временно
+                "category": category,
+                "path":     path,
+                "_loaded":  False,
+            }
+            items_found += 1
+
+        log.info(f"Найдено {items_found} предметов в дереве GitHub")
+
+        # Подгружаем имена для первых 500 предметов (быстрый batch)
+        await load_item_names_batch(list(ITEMS_DB.keys())[:500])
+
     except Exception as e:
-        log.error(f"Ошибка загрузки предметов: {e}")
+        log.error(f"Ошибка загрузки дерева: {e}")
+
+
+async def load_item_names_batch(item_ids: List[str]):
+    """Подгружает имена предметов из GitHub."""
+    async def fetch_one(session, item_id):
+        info = ITEMS_DB.get(item_id)
+        if not info or info.get("_loaded"):
+            return
+        path = info.get("path", "")
+        if not path:
+            return
+        try:
+            url = f"{GITHUB_RAW}/{path}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    d = await resp.json(content_type=None)
+                    name_obj = d.get("name", {})
+                    if isinstance(name_obj, dict):
+                        lines = name_obj.get("lines", {})
+                        name = lines.get("ru", lines.get("en", item_id))
+                    else:
+                        name = str(name_obj) if name_obj else item_id
+                    ITEMS_DB[item_id]["name"]    = name
+                    ITEMS_DB[item_id]["_loaded"] = True
+        except Exception:
+            pass
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_one(session, iid) for iid in item_ids]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    log.info(f"Имена загружены для {sum(1 for v in ITEMS_DB.values() if v.get('_loaded'))} предметов")
+
 
 @app.on_event("startup")
 async def startup():
-    await get_access_token()
     await load_items()
 
-# ── Helpers ──────────────────────────────────────────────────────
-async def ensure_items():
-    """Загружает предметы если база пустая."""
-    if not ITEMS_DB:
-        await load_items()
 
 def search_ids(query: str = "", category: str = "") -> List[str]:
+    if not ITEMS_DB:
+        return []
     q = query.lower().strip()
     result = []
     for iid, d in ITEMS_DB.items():
         if category and d.get("category") != category:
             continue
         if q:
-            name = d.get("name", "").lower()
-            if not (q in name or any(w in name for w in q.split())):
+            name = d.get("name", iid).lower()
+            if not (q in name or q in iid.lower() or
+                    any(w in name for w in q.split())):
                 continue
         result.append(iid)
     return result
+
 
 def fmt_time_left(end_str: str) -> str:
     try:
@@ -120,6 +181,7 @@ def fmt_time_left(end_str: str) -> str:
     except Exception:
         return "—"
 
+
 def enrich_lot(lot: dict, item_id: str) -> dict:
     lot["_id"]       = item_id
     lot["_name"]     = ITEMS_DB.get(item_id, {}).get("name", item_id)
@@ -133,18 +195,25 @@ def enrich_lot(lot: dict, item_id: str) -> dict:
     lot["_perUnit"]  = price // amt if amt > 1 and price else None
     return lot
 
-# ── Routes ───────────────────────────────────────────────────────
+
 @app.get("/api/health")
 async def health():
-    await ensure_items()
-    if not _access_token:
-        await get_access_token()
-    return {"status": "ok", "items": len(ITEMS_DB), "token": bool(_access_token)}
+    await load_items()
+    return {
+        "status": "ok",
+        "items":  len(ITEMS_DB),
+        "loaded": sum(1 for v in ITEMS_DB.values() if v.get("_loaded")),
+    }
+
 
 @app.get("/api/items/search")
 async def api_items_search(q: str = "", category: str = "", limit: int = 30):
+    await load_items()
     ids = search_ids(q, category)[:limit]
-    return [{"id": iid, **ITEMS_DB[iid]} for iid in ids if iid in ITEMS_DB]
+    return [{"id": iid, "name": ITEMS_DB[iid]["name"],
+             "category": ITEMS_DB[iid]["category"]}
+            for iid in ids if iid in ITEMS_DB]
+
 
 @app.get("/api/lots")
 async def api_lots(
@@ -154,15 +223,19 @@ async def api_lots(
     sort: str = "price", asc: bool = True,
     page: int = 0, per_page: int = 10,
 ):
-    await ensure_items()
-    if not _access_token: await get_access_token()
+    await load_items()
     ids = search_ids(q, category)
     if not ids:
         return {"lots": [], "total": 0, "page": page, "pages": 0}
 
+    # Подгружаем имена если не загружены
+    unloaded = [iid for iid in ids[:40] if not ITEMS_DB.get(iid, {}).get("_loaded")]
+    if unloaded:
+        await load_item_names_batch(unloaded)
+
     rar_vals = RARITY_MAP.get(rarity) if rarity else None
 
-    async with aiohttp.ClientSession(headers=sc_headers()) as session:
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
         tasks = [
             session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200})
             for iid in ids[:40]
@@ -201,11 +274,15 @@ async def api_lots(
     filtered.sort(key=_key, reverse=not asc)
     total = len(filtered)
     pages = max(1, -(-total // per_page))
-    return {"lots": filtered[page*per_page:(page+1)*per_page], "total": total, "page": page, "pages": pages}
+    return {
+        "lots":  filtered[page*per_page:(page+1)*per_page],
+        "total": total, "page": page, "pages": pages,
+    }
+
 
 @app.get("/api/history/{item_id}")
 async def api_history(item_id: str, limit: int = 50):
-    async with aiohttp.ClientSession(headers=sc_headers()) as session:
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
         try:
             async with session.get(
                 f"{API_BASE}/auction/{item_id}/history", params={"limit": limit}
@@ -236,22 +313,33 @@ async def api_history(item_id: str, limit: int = 50):
         if p and ts:
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                chart_data.append({"ts": dt.isoformat(), "price": p, "amount": r.get("amount", 1)})
+                chart_data.append({"ts": dt.isoformat(), "price": p,
+                                   "amount": r.get("amount", 1)})
             except Exception:
                 pass
     chart_data.sort(key=lambda x: x["ts"])
-    return {"item_id": item_id, "item_name": ITEMS_DB.get(item_id, {}).get("name", item_id),
-            "records": chart_data, "stats": stats}
+    return {
+        "item_id":   item_id,
+        "item_name": ITEMS_DB.get(item_id, {}).get("name", item_id),
+        "records":   chart_data,
+        "stats":     stats,
+    }
+
 
 @app.get("/api/profitable")
-async def api_profitable(q: str = "", category: str = "", rarity: str = "", threshold: float = 0.80):
+async def api_profitable(
+    q: str = "", category: str = "",
+    rarity: str = "", threshold: float = 0.80,
+):
+    await load_items()
     ids      = search_ids(q, category)[:30]
     rar_vals = RARITY_MAP.get(rarity) if rarity else None
     if not ids:
         return {"lots": [], "stats": {"checked": 0, "found": 0}}
 
-    async with aiohttp.ClientSession(headers=sc_headers()) as session:
-        tasks     = [session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200}) for iid in ids]
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
+        tasks     = [session.get(f"{API_BASE}/auction/{iid}/lots",
+                                  params={"limit": 200}) for iid in ids]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     by_item: dict = {}
@@ -280,7 +368,8 @@ async def api_profitable(q: str = "", category: str = "", rarity: str = "", thre
                 p = lot.get("buyoutPrice") or lot.get("startPrice") or 0
                 if 0 < p <= med * threshold:
                     disc = round((1 - p/med)*100, 1)
-                    lot.update({"_discount": disc, "_avg_price": int(med), "_profit_label": f"-{disc}% от рынка"})
+                    lot.update({"_discount": disc, "_avg_price": int(med),
+                                "_profit_label": f"-{disc}% от рынка"})
                     profitable.append(lot)
 
     seen = set(); unique = []
