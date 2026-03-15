@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+STALCRAFT Auction — FastAPI Backend Proxy
+Проксирует запросы к Stalcraft API и считает аналитику
+"""
+
+import asyncio
+import json
+import os
+import statistics
+import logging
+from typing import Optional, List
+from datetime import datetime, timezone
+
+import aiohttp
+import aiosqlite
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# ── Конфиг ──────────────────────────────────────────────────────
+SC_TOKEN  = os.getenv("SC_TOKEN", "0dMttjkdBsyVyRSRInJpKYWahGnSxBwgFehkuTCb")
+REGION    = os.getenv("REGION", "ru")
+API_BASE  = f"https://eapi.stalcraft.net/{REGION}"
+DB_PATH   = "miniapp_data.db"
+ITEMS_CACHE = "items_cache.json"
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ── FastAPI ──────────────────────────────────────────────────────
+app = FastAPI(title="STALCRAFT Auction API", version="2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ITEMS_DB: dict = {}
+SC_HEADERS = {"Authorization": f"Bearer {SC_TOKEN}"}
+
+
+# ── DB ───────────────────────────────────────────────────────────
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id       TEXT PRIMARY KEY,
+                notifications INTEGER DEFAULT 0,
+                items_per_page INTEGER DEFAULT 10,
+                settings_json TEXT DEFAULT '{}'
+            )
+        """)
+        await db.commit()
+
+
+async def db_get_settings(user_id: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT notifications, items_per_page FROM user_settings WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if row:
+        return {"notifications": bool(row[0]), "items_per_page": row[1]}
+    return {"notifications": False, "items_per_page": 10}
+
+
+async def db_save_settings(user_id: str, notif: bool, ipp: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO user_settings(user_id, notifications, items_per_page)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                notifications  = excluded.notifications,
+                items_per_page = excluded.items_per_page
+        """, (user_id, int(notif), ipp))
+        await db.commit()
+
+
+# ── Items DB ─────────────────────────────────────────────────────
+async def load_items():
+    global ITEMS_DB
+    if os.path.exists(ITEMS_CACHE):
+        with open(ITEMS_CACHE, "r", encoding="utf-8") as f:
+            ITEMS_DB = json.load(f)
+        log.info(f"Items: {len(ITEMS_DB)} загружено из кэша")
+        return
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
+        try:
+            async with session.get(f"{API_BASE}/items", params={"limit": 9999}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    raw = data.get("items", data) if isinstance(data, dict) else data
+                    for item in raw:
+                        iid = item.get("id", "")
+                        if iid:
+                            ITEMS_DB[iid] = {
+                                "name": item.get("name", {}).get("ru", iid)
+                                        if isinstance(item.get("name"), dict)
+                                        else item.get("name", iid),
+                                "category": item.get("category", "misc"),
+                            }
+        except Exception as e:
+            log.error(f"Items load error: {e}")
+    if ITEMS_DB:
+        with open(ITEMS_CACHE, "w", encoding="utf-8") as f:
+            json.dump(ITEMS_DB, f, ensure_ascii=False)
+
+
+@app.on_event("startup")
+async def startup():
+    await db_init()
+    await load_items()
+
+
+# ── Helpers ──────────────────────────────────────────────────────
+RARITY_MAP = {
+    "white":  [0],
+    "green":  [1],
+    "blue":   [2],
+    "red":    [3, 4],
+    "yellow": [5],
+}
+
+def search_ids(query: str = "", category: str = "") -> List[str]:
+    q = query.lower().strip()
+    result = []
+    for iid, d in ITEMS_DB.items():
+        if category and d.get("category") != category:
+            continue
+        if q:
+            name = d.get("name", "").lower()
+            if not (q in name or any(w in name for w in q.split())):
+                continue
+        result.append(iid)
+    return result
+
+def fmt_time_left(end_str: str) -> str:
+    try:
+        end   = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        delta = end - datetime.now(timezone.utc)
+        s     = int(delta.total_seconds())
+        if s <= 0: return "Истёк"
+        d, r = divmod(s, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+        if d:  return f"{d}д {h}ч"
+        if h:  return f"{h}ч {m}м"
+        return f"{m}м"
+    except Exception:
+        return "—"
+
+def enrich_lot(lot: dict, item_id: str) -> dict:
+    lot["_id"]       = item_id
+    lot["_name"]     = ITEMS_DB.get(item_id, {}).get("name", item_id)
+    lot["_category"] = ITEMS_DB.get(item_id, {}).get("category", "misc")
+    lot["_timeLeft"] = fmt_time_left(lot.get("endTime", ""))
+    add = lot.get("additional", {})
+    lot["_quality"]  = add.get("quality", 0)
+    lot["_enh"]      = add.get("potentialLevel", 0)
+    amt = lot.get("amount", 1) or 1
+    price = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+    lot["_perUnit"]  = price // amt if amt > 1 and price else None
+    return lot
+
+
+# ── API Routes ───────────────────────────────────────────────────
+
+@app.get("/api/items/search")
+async def api_items_search(q: str = "", category: str = "", limit: int = 30):
+    """Поиск предметов для автокомплита."""
+    ids = search_ids(q, category)[:limit]
+    return [{"id": iid, **ITEMS_DB[iid]} for iid in ids if iid in ITEMS_DB]
+
+
+@app.get("/api/lots")
+async def api_lots(
+    q:          str = "",
+    category:   str = "",
+    rarity:     str = "",
+    enhancement:str = "",
+    qty_from:   Optional[int] = None,
+    qty_to:     Optional[int] = None,
+    seller:     str = "",
+    sort:       str = "price",
+    asc:        bool = True,
+    page:       int = 0,
+    per_page:   int = 10,
+):
+    ids = search_ids(q, category)
+    if not ids:
+        return {"lots": [], "total": 0, "page": page, "pages": 0}
+
+    rar_vals = RARITY_MAP.get(rarity) if rarity else None
+
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
+        tasks = [
+            session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit": 200})
+            for iid in ids[:40]
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        all_lots = []
+        for resp, iid in zip(responses, ids[:40]):
+            if isinstance(resp, Exception): continue
+            try:
+                data = await resp.json()
+                for lot in data.get("lots", []):
+                    all_lots.append(enrich_lot(lot, iid))
+            except Exception:
+                pass
+
+    # Filters
+    filtered = []
+    for lot in all_lots:
+        if rar_vals is not None and lot["_quality"] not in rar_vals:
+            continue
+        if enhancement and lot["_enh"] != int(enhancement):
+            continue
+        amt = lot.get("amount", 1)
+        if qty_from is not None and amt < qty_from: continue
+        if qty_to   is not None and amt > qty_to:   continue
+        if seller:
+            s = (lot.get("sellerName") or lot.get("seller") or "").lower()
+            if seller.lower() not in s: continue
+        filtered.append(lot)
+
+    # Sort
+    def _key(l):
+        if sort == "per_unit":
+            amt = l.get("amount",1) or 1
+            return (l.get("buyoutPrice") or l.get("startPrice") or 0) / amt
+        if sort == "price":  return l.get("buyoutPrice") or l.get("startPrice") or 0
+        if sort == "bid":    return l.get("startPrice", 0)
+        return l.get("endTime", "")
+    filtered.sort(key=_key, reverse=not asc)
+
+    total = len(filtered)
+    pages = max(1, -(-total // per_page))
+    start = page * per_page
+    return {"lots": filtered[start:start+per_page], "total": total,
+            "page": page, "pages": pages}
+
+
+@app.get("/api/history/{item_id}")
+async def api_history(item_id: str, limit: int = 50):
+    """История продаж предмета + статистика."""
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
+        try:
+            async with session.get(
+                f"{API_BASE}/auction/{item_id}/history", params={"limit": limit}
+            ) as resp:
+                if resp.status != 200:
+                    raise HTTPException(404, "История не найдена")
+                data = await resp.json()
+                records = data.get("prices", data) if isinstance(data, dict) else data
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    prices = [r.get("price", r.get("buyoutPrice", 0)) for r in records if r.get("price") or r.get("buyoutPrice")]
+    stats  = {}
+    if prices:
+        stats = {
+            "min":    min(prices),
+            "max":    max(prices),
+            "avg":    int(sum(prices) / len(prices)),
+            "median": int(statistics.median(prices)),
+            "stdev":  int(statistics.stdev(prices)) if len(prices) > 2 else 0,
+        }
+
+    # Format for chart
+    chart_data = []
+    for r in records:
+        p  = r.get("price", r.get("buyoutPrice", 0))
+        ts = r.get("time", r.get("soldAt", ""))
+        if p and ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                chart_data.append({"ts": dt.isoformat(), "price": p,
+                                   "amount": r.get("amount", 1)})
+            except Exception:
+                pass
+
+    chart_data.sort(key=lambda x: x["ts"])
+    item_name = ITEMS_DB.get(item_id, {}).get("name", item_id)
+    return {"item_id": item_id, "item_name": item_name,
+            "records": chart_data, "stats": stats}
+
+
+@app.get("/api/profitable")
+async def api_profitable(
+    q:        str = "",
+    category: str = "",
+    rarity:   str = "",
+    threshold: float = 0.80,
+):
+    """Лоты ниже медианной цены."""
+    ids     = search_ids(q, category)[:30]
+    rar_vals = RARITY_MAP.get(rarity) if rarity else None
+
+    if not ids:
+        return {"lots": [], "stats": {"checked": 0, "found": 0}}
+
+    async with aiohttp.ClientSession(headers=SC_HEADERS) as session:
+        tasks = [session.get(f"{API_BASE}/auction/{iid}/lots", params={"limit":200})
+                 for iid in ids]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    by_item: dict = {}
+    for resp, iid in zip(responses, ids):
+        if isinstance(resp, Exception): continue
+        try:
+            data = await resp.json()
+            lots = []
+            for lot in data.get("lots", []):
+                lot = enrich_lot(lot, iid)
+                if rar_vals and lot["_quality"] not in rar_vals: continue
+                lots.append(lot)
+            if lots:
+                by_item[iid] = lots
+        except Exception:
+            pass
+
+    profitable = []
+    total_checked = 0
+
+    for iid, lots in by_item.items():
+        total_checked += len(lots)
+        if len(lots) < 2: continue
+
+        # Method 1 — buyout price vs median
+        prices = [l.get("buyoutPrice") or l.get("startPrice") or 0 for l in lots]
+        nz = [p for p in prices if p > 0]
+        if len(nz) >= 2:
+            med = statistics.median(nz)
+            for lot in lots:
+                p = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+                if 0 < p <= med * threshold:
+                    disc = round((1 - p / med) * 100, 1)
+                    lot["_discount"] = disc
+                    lot["_avg_price"] = int(med)
+                    lot["_profit_label"] = f"-{disc}% от рынка"
+                    profitable.append(lot)
+
+        # Method 2 — per unit for stacks
+        stacks = [l for l in lots if (l.get("amount") or 1) > 1]
+        if stacks:
+            pu = []
+            for l in stacks:
+                amt = l.get("amount",1) or 1
+                p   = l.get("buyoutPrice") or l.get("startPrice") or 0
+                if p > 0: pu.append(p / amt)
+            if len(pu) >= 2:
+                med_pu = statistics.median(pu)
+                for lot in stacks:
+                    if "_discount" in lot: continue
+                    amt = lot.get("amount",1) or 1
+                    p   = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+                    if p <= 0: continue
+                    if p/amt <= med_pu * threshold:
+                        disc = round((1 - p/amt/med_pu)*100, 1)
+                        lot["_discount"] = disc
+                        lot["_avg_price"] = int(med_pu * amt)
+                        lot["_profit_label"] = f"-{disc}% за шт."
+                        profitable.append(lot)
+
+    # Dedup & sort
+    seen = set(); unique = []
+    for l in profitable:
+        k = (l.get("_id"), l.get("startTime",""), l.get("startPrice",0))
+        if k not in seen: seen.add(k); unique.append(l)
+    unique.sort(key=lambda l: l.get("_discount",0), reverse=True)
+
+    return {
+        "lots":  unique[:50],
+        "stats": {"checked": total_checked, "found": len(unique)},
+    }
+
+
+@app.get("/api/settings/{user_id}")
+async def api_get_settings(user_id: str):
+    return await db_get_settings(user_id)
+
+
+class SettingsIn(BaseModel):
+    notifications: bool = False
+    items_per_page: int = 10
+
+@app.post("/api/settings/{user_id}")
+async def api_save_settings(user_id: str, body: SettingsIn):
+    await db_save_settings(user_id, body.notifications, body.items_per_page)
+    return {"ok": True}
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "items": len(ITEMS_DB)}
