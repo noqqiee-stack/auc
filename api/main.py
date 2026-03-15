@@ -380,6 +380,7 @@ async def lots(
     enhancement:str="", qty_from:Optional[int]=None, qty_to:Optional[int]=None,
     sort:str="price", asc:bool=True, page:int=0, per_page:int=10,
     item_id: str = "",
+    studied: Optional[bool] = None,
 ):
     await load_items()
 
@@ -425,7 +426,15 @@ async def lots(
                 ri = info.get("rank_idx", -1)
                 if ri not in rar_vals:
                     continue
-        if enhancement and lot["_enh"] != int(enhancement): continue
+        if enhancement and lot["_enh"] != int(enhancement): 
+            continue
+        if studied is not None:
+            flag = lot.get("_studied")
+            if flag is None:
+                # если API не вернул флаг — считаем, что такой лот не подходит под точный фильтр
+                continue
+            if bool(flag) != bool(studied):
+                continue
         amt = lot.get("amount",1)
         if qty_from is not None and amt < qty_from: continue
         if qty_to   is not None and amt > qty_to:   continue
