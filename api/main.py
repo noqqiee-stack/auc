@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, json, os, statistics, logging, re
+import asyncio, json, os, statistics, logging
 from typing import Optional, List
 from datetime import datetime, timezone
 import aiohttp
@@ -36,67 +36,28 @@ QUALITY_KEYS = {
 }
 RANK_KEYS = {
     "core.rank.picklock": 0,
-    "core.rank.novice":   1,
-    "core.rank.stalker":  2,
-    "core.rank.veteran":  3,
-    "core.rank.master":   4,
-    "core.rank.legend":   5,
+    "core.rank.stalker":  1,
+    "core.rank.veteran":  2,
+    "core.rank.master":   3,
+    "core.rank.legend":   4,
 }
 
 # Numeric quality from API lots → display info
 ART_QUALITY_NAMES = {
-    0: "Обычный",
-    1: "Необычный",
-    2: "Особый",
-    3: "Редкий",
-    4: "Исключительный",
-    5: "Легендарный",
+    0:"Обычный", 1:"Необычный", 2:"Особый",
+    3:"Редкий",  4:"Исключительный", 5:"Легендарный"
 }
-
-# Цвета редкостей артефактов:
-# обычный - белый; необычный - зелёный; особый - синий;
-# исключительный - красный; легендарный - жёлтый.
 ART_QUALITY_COLORS = {
-    0: "#ffffff",  # обычный — белый
-    1: "#4ade80",  # необычный — зелёный
-    2: "#60a5fa",  # особый — синий
-    3: "#f472b6",  # редкий — розовый
-    4: "#f97474",  # исключительный — красный
-    5: "#fbbf24",  # легендарный — жёлтый
+    0:"#9ca3af", 1:"#4ade80", 2:"#60a5fa",
+    3:"#c084fc", 4:"#f97474", 5:"#fbbf24"
 }
+RANK_NAMES  = {0:"Отмычка", 1:"Сталкер", 2:"Ветеран", 3:"Мастер", 4:"Легенда"}
+RANK_COLORS = {0:"#9ca3af", 1:"#60a5fa", 2:"#f472b6", 3:"#f97474", 4:"#fbbf24"}
 
-# Цвета рангов остальных предметов:
-# белый - отмычка; новичек - зелёный; сталкер - синий;
-# ветеран - розовый; мастер - красный; легенда - жёлтый.
-RANK_NAMES  = {0: "Отмычка", 1: "Сталкер", 2: "Ветеран", 3: "Мастер", 4: "Легенда"}
-RANK_COLORS = {
-    0: "#ffffff",  # Отмычка — белый
-    1: "#4ade80",  # Новичок — зелёный
-    2: "#60a5fa",  # Сталкер — синий
-    3: "#f472b6",  # Ветеран — розовый
-    4: "#f97474",  # Мастер — красный
-    5: "#fbbf24",  # Легенда — жёлтый
-}
-
-# Для фильтрации по редкости артефактов (только артефакты)
-ART_RARITY_MAP = {
-    "white":  [0],
-    "green":  [1],
-    "blue":   [2],
-    "red":    [3, 4],
-    "yellow": [5],
-}
-
-# Значения качества в процентах, которые возвращает аукцион для артефактов
-# (см. официальные описания: Ordinary/Unordinary/...):
-# 100, 115, 130, 145, 160, 175 → индексы 0..5
-QUALITY_PCT_TO_IDX = {
-    100: 0,  # ordinary  (обычный)
-    115: 1,  # unordinary (необычный)
-    130: 2,  # special   (особый)
-    145: 3,  # rare      (редкий)
-    160: 4,  # exclusive (исключительный)
-    175: 5,  # legendary (легендарный)
+# For rarity filter param
+RARITY_MAP = {
+    "white": [0], "green": [1], "blue": [2],
+    "purple": [3], "red": [4], "yellow": [5]
 }
 
 # ── Category → main category mapping ─────────────────────────
@@ -144,7 +105,6 @@ async def load_items():
 
         tree = data.get("tree", [])
         count = 0
-        ids: List[str] = []
         for node in tree:
             path = node.get("path","")
             # Items: ru/items/{category}/{optional_subcat}/{id}.json
@@ -166,12 +126,10 @@ async def load_items():
                 "item_path":  path,
                 "_loaded":    False,
             }
-            ids.append(item_id)
             count += 1
         log.info(f"Найдено {count} предметов в дереве")
-        # Загружаем имена / качество / ранг для всех предметов пачками,
-        # чтобы поиск сразу работал по любому предмету из БД EXBO.
-        await batch_load(ids)
+        # Load names+quality for first 500 items
+        await batch_load(list(ITEMS_DB.keys())[:500])
     except Exception as e:
         log.error(f"load_items error: {e}")
 
@@ -233,54 +191,16 @@ async def startup():
     await load_items()
 
 # ── Search ────────────────────────────────────────────────────
-def _match_left_to_right(ql: str, name: str, iid: str) -> bool:
-    """
-    Поиск только слева направо:
-    - запрос разбивается на слова;
-    - слова должны идти в том же порядке, что и слова в названии;
-    - каждое слово запроса должно быть префиксом соответствующего слова названия;
-    - дополнительно разрешаем одиночный токен как префикс id.
-    """
-    if not ql:
-        return True
-
-    tokens = [t for t in ql.split() if t]
-    if not tokens:
-        return True
-
-    base = (name or iid).lower()
-    # делим по любым не-буквенно-цифровым символам (включая кавычки, длинные тире и т.п.)
-    words = [w for w in re.split(r"[^\w]+", base, flags=re.UNICODE) if w]
-
-    # Пытаемся сопоставить последовательность токенов с последовательностью слов
-    for start in range(0, max(0, len(words) - len(tokens) + 1)):
-        ok = True
-        for offset, tk in enumerate(tokens):
-            w = words[start + offset]
-            if not w.startswith(tk):
-                ok = False
-                break
-        if ok:
-            return True
-
-    # Дополнительно: один токен может быть префиксом id
-    if len(tokens) == 1 and iid.lower().startswith(tokens[0]):
-        return True
-
-    return False
-
-
 def search_ids(q: str = "", category: str = "") -> List[str]:
-    if not ITEMS_DB:
-        return []
+    if not ITEMS_DB: return []
     ql = q.lower().strip()
-    result: List[str] = []
+    result = []
     for iid, d in ITEMS_DB.items():
-        if category and d.get("category") != category:
-            continue
+        if category and d.get("category") != category: continue
         if ql:
             name = d.get("name", iid).lower()
-            if not _match_left_to_right(ql, name, iid):
+            if not (ql in name or ql in iid.lower() or
+                    any(w in name for w in ql.split())):
                 continue
         result.append(iid)
     return result
@@ -307,27 +227,19 @@ def enrich(lot: dict, iid: str) -> dict:
     lot["_icon"]     = info.get("icon_path","")
     lot["_timeLeft"] = fmt_time(lot.get("endTime",""))
     add = lot.get("additional",{})
-    raw_quality = add.get("quality", 0)
-    # Для артефактов аукцион часто отдаёт качество в процентах (100,115,...,175),
-    # поэтому сначала пробуем привести процент к индексу 0..5.
-    if isinstance(raw_quality, (int, float)) and raw_quality > 10:
-        quality = QUALITY_PCT_TO_IDX.get(int(raw_quality), 0)
-    else:
-        quality = int(raw_quality or 0)
+    quality = add.get("quality", 0)
     lot["_quality"]  = quality
     lot["_enh"]      = add.get("potentialLevel",0)
     lot["_studied"]  = add.get("isResearched", add.get("researched", None))
     # Color and name based on category
     art = is_artefact(info.get("category",""))
     if art:
-        # Для артефактов цвет / редкость берём из качества лота
         lot["_color_hex"] = ART_QUALITY_COLORS.get(quality, "#9ca3af")
         lot["_rarity_name"] = ART_QUALITY_NAMES.get(quality, "—")
     else:
-        # Для остальных предметов цвет зависит от ранга предмета из БД EXBO
-        rank_idx = info.get("rank_idx", -1)
-        lot["_color_hex"] = RANK_COLORS.get(rank_idx, "#9ca3af")
-        lot["_rarity_name"] = RANK_NAMES.get(rank_idx, "—") if rank_idx >= 0 else "—"
+        # For non-artifacts, quality maps to rank
+        lot["_color_hex"] = RANK_COLORS.get(quality, "#9ca3af")
+        lot["_rarity_name"] = RANK_NAMES.get(quality, "—")
     amt = lot.get("amount",1) or 1
     price = lot.get("buyoutPrice") or lot.get("startPrice") or 0
     lot["_perUnit"] = price // amt if amt > 1 and price else None
@@ -356,16 +268,14 @@ async def items_search(q: str="", category: str="", limit: int=40):
     for iid in ids[:limit]:
         if iid not in ITEMS_DB: continue
         d = ITEMS_DB[iid]
-        # Для списка поиска:
-        #  - артефакты не имеют "базовой" редкости — показываем только категорию;
-        #  - остальные предметы используют ранг из БД EXBO.
+        # Determine color for display
         art = is_artefact(d.get("category",""))
         qi  = d.get("quality_idx", -1)
         ri  = d.get("rank_idx", -1)
-        if art:
-            color_hex = "#9ca3af"
-            rarity_name = ""
-        elif ri >= 0:
+        if art and qi >= 0:
+            color_hex  = ART_QUALITY_COLORS.get(qi, "#9ca3af")
+            rarity_name = ART_QUALITY_NAMES.get(qi, "")
+        elif not art and ri >= 0:
             color_hex  = RANK_COLORS.get(ri, "#9ca3af")
             rarity_name = RANK_NAMES.get(ri, "")
         else:
@@ -390,25 +300,14 @@ async def lots(
     q:str="", category:str="", rarity:str="",
     enhancement:str="", qty_from:Optional[int]=None, qty_to:Optional[int]=None,
     sort:str="price", asc:bool=True, page:int=0, per_page:int=10,
-    item_id: str = "",
 ):
     await load_items()
+    ids = search_ids(q, category)
+    if not ids: return {"lots":[],"total":0,"page":page,"pages":0}
+    unloaded = [i for i in ids[:40] if not ITEMS_DB.get(i,{}).get("_loaded")]
+    if unloaded: await batch_load(unloaded)
 
-    # Если передан конкретный item_id — работаем только с ним
-    if item_id:
-        ids = [item_id] if item_id in ITEMS_DB else []
-    else:
-        ids = search_ids(q, category)
-    if not ids:
-        return {"lots": [], "total": 0, "page": page, "pages": 0}
-    unloaded = [i for i in ids[:40] if not ITEMS_DB.get(i, {}).get("_loaded")]
-    if unloaded:
-        await batch_load(unloaded)
-
-    # Фильтрация по редкости / рангу:
-    #  - для артефактов — по качеству лота;
-    #  - для остальных предметов — по рангу предмета из БД EXBO.
-    rar_vals = ART_RARITY_MAP.get(rarity) if rarity else None
+    rar_vals = RARITY_MAP.get(rarity) if rarity else None
 
     async with aiohttp.ClientSession(headers=sc_hdrs()) as s:
         responses = await asyncio.gather(
@@ -425,17 +324,7 @@ async def lots(
 
     filtered = []
     for lot in all_lots:
-        if rar_vals is not None:
-            if is_artefact(lot.get("_category", "")):
-                # артефакты — по качеству лота
-                if lot["_quality"] not in rar_vals:
-                    continue
-            else:
-                # остальные предметы — по рангу предмета
-                info = ITEMS_DB.get(lot.get("_id",""), {})
-                ri = info.get("rank_idx", -1)
-                if ri not in rar_vals:
-                    continue
+        if rar_vals is not None and lot["_quality"] not in rar_vals: continue
         if enhancement and lot["_enh"] != int(enhancement): continue
         amt = lot.get("amount",1)
         if qty_from is not None and amt < qty_from: continue
@@ -443,30 +332,16 @@ async def lots(
         filtered.append(lot)
 
     def key(l):
-        if sort == "per_unit":
-            amt = l.get("amount", 1) or 1
-            return (l.get("buyoutPrice") or l.get("startPrice") or 0) / amt
-        if sort == "price":
-            return l.get("buyoutPrice") or l.get("startPrice") or 0
-        if sort == "bid":
-            return l.get("startPrice", 0)
-        if sort == "amount":
-            return l.get("amount", 0)
-        if sort == "quality":
-            return l.get("_quality", 0)
-        if sort == "time":
-            return l.get("endTime", "")
-        return l.get("endTime", "")
+        if sort=="per_unit": amt=l.get("amount",1) or 1; return (l.get("buyoutPrice") or l.get("startPrice") or 0)/amt
+        if sort=="price":    return l.get("buyoutPrice") or l.get("startPrice") or 0
+        if sort=="bid":      return l.get("startPrice",0)
+        if sort=="amount":   return l.get("amount",0)
+        if sort=="quality":  return l.get("_quality",0)
+        return l.get("endTime","")
 
     filtered.sort(key=key, reverse=not asc)
-    total = len(filtered)
-    pages = max(1, -(total // -per_page))
-    return {
-        "lots": filtered[page * per_page : (page + 1) * per_page],
-        "total": total,
-        "page": page,
-        "pages": pages,
-    }
+    total = len(filtered); pages = max(1, -(total//-per_page))
+    return {"lots":filtered[page*per_page:(page+1)*per_page],"total":total,"page":page,"pages":pages}
 
 @app.get("/api/history/{item_id}")
 async def history(item_id: str, limit: int=50):
@@ -481,27 +356,8 @@ async def history(item_id: str, limit: int=50):
     prices = [r.get("price", r.get("buyoutPrice",0)) for r in records if r.get("price") or r.get("buyoutPrice")]
     stats = {}
     if prices:
-        stats = {
-            "min": min(prices),
-            "max": max(prices),
-            "avg": int(sum(prices) / len(prices)),
-            "median": int(statistics.median(prices)),
-            "stdev": int(statistics.stdev(prices)) if len(prices) > 2 else 0,
-        }
-
-    # Определяем цвет по редкости / рангу предмета
-    info = ITEMS_DB.get(item_id, {})
-    cat = info.get("category", "")
-    art = is_artefact(cat)
-    qi = info.get("quality_idx", -1)
-    ri = info.get("rank_idx", -1)
-    if art and qi >= 0:
-        color_hex = ART_QUALITY_COLORS.get(qi, "#9ca3af")
-    elif not art and ri >= 0:
-        color_hex = RANK_COLORS.get(ri, "#9ca3af")
-    else:
-        color_hex = "#9ca3af"
-
+        stats = {"min":min(prices),"max":max(prices),"avg":int(sum(prices)/len(prices)),
+                 "median":int(statistics.median(prices)),"stdev":int(statistics.stdev(prices)) if len(prices)>2 else 0}
     chart = []
     for r in records:
         p=r.get("price",r.get("buyoutPrice",0)); ts=r.get("time",r.get("soldAt",""))
@@ -511,12 +367,45 @@ async def history(item_id: str, limit: int=50):
                 chart.append({"ts":dt.isoformat(),"price":p,"amount":r.get("amount",1)})
             except: pass
     chart.sort(key=lambda x:x["ts"])
-    return {
-        "item_id": item_id,
-        "item_name": info.get("name", item_id),
-        "records": chart,
-        "stats": stats,
-        "color_hex": color_hex,
-        "is_artefact": art,
-    }
+    return {"item_id":item_id,"item_name":ITEMS_DB.get(item_id,{}).get("name",item_id),"records":chart,"stats":stats}
 
+@app.get("/api/profitable")
+async def profitable(q:str="", category:str="", rarity:str="", threshold:float=0.80):
+    await load_items()
+    ids = search_ids(q, category)[:30]
+    rar_vals = RARITY_MAP.get(rarity) if rarity else None
+    if not ids: return {"lots":[],"stats":{"checked":0,"found":0}}
+    async with aiohttp.ClientSession(headers=sc_hdrs()) as s:
+        responses = await asyncio.gather(
+            *[s.get(f"{API_BASE}/auction/{i}/lots", params={"limit":200}) for i in ids],
+            return_exceptions=True
+        )
+    by_item: dict = {}
+    for r, i in zip(responses, ids):
+        if isinstance(r, Exception): continue
+        try:
+            d = await r.json()
+            lots = [enrich(l,i) for l in d.get("lots",[])]
+            if rar_vals: lots = [l for l in lots if l["_quality"] in rar_vals]
+            if lots: by_item[i] = lots
+        except: pass
+    profitable = []; checked = 0
+    for i, lots in by_item.items():
+        checked += len(lots)
+        if len(lots) < 2: continue
+        nz = [l.get("buyoutPrice") or l.get("startPrice") or 0 for l in lots]
+        nz = [p for p in nz if p > 0]
+        if len(nz) >= 2:
+            med = statistics.median(nz)
+            for lot in lots:
+                p = lot.get("buyoutPrice") or lot.get("startPrice") or 0
+                if 0 < p <= med * threshold:
+                    disc = round((1-p/med)*100,1)
+                    lot.update({"_discount":disc,"_avg_price":int(med),"_profit_label":f"-{disc}% от рынка"})
+                    profitable.append(lot)
+    seen = set(); unique = []
+    for l in profitable:
+        k = (l.get("_id"), l.get("startTime",""), l.get("startPrice",0))
+        if k not in seen: seen.add(k); unique.append(l)
+    unique.sort(key=lambda l:l.get("_discount",0), reverse=True)
+    return {"lots":unique[:50],"stats":{"checked":checked,"found":len(unique)}}
